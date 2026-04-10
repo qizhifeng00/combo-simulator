@@ -1,0 +1,15 @@
+{
+  "name": "combo-simulator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "simulate": "node combo-simulator.cjs"
+  },
+  "dependencies": {
+    "koishipro-core.js": "^1.4.4",
+    "ygopro-cdb-encode": "^1.1.0",
+    "ygopro-msg-encode": "^1.2.2",
+    "ygopro-yrp-encode": "^1.0.1"
+  }
+}
