@@ -2,9 +2,10 @@
   "name": "combo-simulator",
   "version": "0.0.0",
   "private": true,
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
-    "simulate": "node combo-simulator.cjs"
+    "simulate": "node combo-simulator.cjs",
+    "simulate:esm": "node combo-simulato.js"
   },
   "dependencies": {
     "koishipro-core.js": "^1.4.4",

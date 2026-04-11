@@ -84,12 +84,13 @@ const BATTLE_CMD = {
 const DEFAULT_OPTIONS = {
   drawCount: 1,
   maxDepth: 200,
-  maxNodes: 2000,
-  maxBeamWidth: 6,
+  maxNodes: 100000,
+  maxBeamWidth: 20,
   maxActionsPerNode: 12,
   maxProcessPerStep: 2000,
+  snapshotPoolSize: 512,
   seed:  2014839433,
-  topK: 5,
+  topK: 20,
 };
 
 const DEFAULT_LIB_DIR = path.join(process.cwd(), 'lib');
@@ -119,10 +120,14 @@ Combo 推演器（koishipro-core.js）
   --opponent-deck     对手 .ydk（默认与 --deck 相同）
   --seed              随机种子（默认 ${DEFAULT_OPTIONS.seed}）
   --draw-count        起手张数（默认 ${DEFAULT_OPTIONS.drawCount}）
+  --opening-cards     固定我方起手卡ID，逗号分隔（需与 --draw-count 数量一致）
+  --opponent-opening-cards
+                      固定对方起手卡ID，逗号分隔（需与 --draw-count 数量一致）
   --max-depth         搜索最大深度（默认 ${DEFAULT_OPTIONS.maxDepth}）
-  --max-nodes         搜索最大节点数（默认 ${DEFAULT_OPTIONS.maxNodes}）
+  --max-nodes         随机搜索节点预算（默认 ${DEFAULT_OPTIONS.maxNodes}）
   --beam-width        Beam 束宽（默认 ${DEFAULT_OPTIONS.maxBeamWidth}）
   --max-actions       每节点最多扩展动作数（默认 ${DEFAULT_OPTIONS.maxActionsPerNode}）
+  --snapshot-pool     状态快照池大小（默认 ${DEFAULT_OPTIONS.snapshotPoolSize}）
   --top               输出步数最多的前 N 条路径（默认 ${DEFAULT_OPTIONS.topK}）
   --expand-script-keywords
                       保留 reposition/set 的脚本关键词，多个关键词用逗号分隔
@@ -174,6 +179,21 @@ function parseKeywordList(input) {
     .filter(Boolean);
 }
 
+function parseCodeList(input, optionName = 'codes') {
+  if (!input) return [];
+  return String(input)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((token) => {
+      const n = Number(token);
+      if (!Number.isFinite(n) || n <= 0) {
+        throw new Error(`${optionName} 包含无效卡片ID: ${token}`);
+      }
+      return n >>> 0;
+    });
+}
+
 function parseYrpVersion(input, fallback = 1) {
   const n = Number(input);
   if (!Number.isFinite(n)) return fallback;
@@ -182,9 +202,13 @@ function parseYrpVersion(input, fallback = 1) {
 
 function cloneHistoryState(state) {
   if (!state || !Array.isArray(state.history)) return { history: [] };
-  return {
+  const out = {
     history: state.history.map((item) => ({ ...item })),
   };
+  if (typeof state.snapshotBase64 === 'string' && state.snapshotBase64) {
+    out.snapshotBase64 = state.snapshotBase64;
+  }
+  return out;
 }
 
 function encodedActionToReplayResponse(action) {
@@ -381,6 +405,21 @@ function simulateOpeningHand(mainDeck, drawCount, seed) {
   };
 }
 
+function buildFixedOpening(mainDeck, openingCards, label = '固定起手') {
+  const remain = mainDeck.slice();
+  const opening = [];
+  for (const rawCode of openingCards ?? []) {
+    const code = rawCode >>> 0;
+    const idx = remain.indexOf(code);
+    if (idx < 0) {
+      throw new Error(`${label} 不在主卡组中或数量不足: ${code}`);
+    }
+    opening.push(code);
+    remain.splice(idx, 1);
+  }
+  return { opening, remain };
+}
+
 class CardTextResolver {
   constructor(sqlDb) {
     this.sqlDb = sqlDb;
@@ -483,6 +522,9 @@ class DuelRunner {
     this.currentDecision = null;
     this.actionHistory = [];
     this.replayCollector = null;
+    this.statePool = new Map();
+    this.statePoolOrder = [];
+    this.maxStatePoolSize = Math.max(0, this.config.snapshotPoolSize ?? DEFAULT_OPTIONS.snapshotPoolSize);
 
     this.classes = {
       Response: ygopro.YGOProMsgResponseBase,
@@ -503,6 +545,64 @@ class DuelRunner {
 
   init() {
     this.rebuildFromHistory([]);
+  }
+
+  makeHistoryKey(history) {
+    if (!Array.isArray(history) || history.length === 0) return '';
+    return history
+      .map((item) =>
+        typeof item?.intResponse === 'number'
+          ? `i:${item.intResponse | 0}`
+          : `b:${item?.responseBase64 ?? ''}`,
+      )
+      .join('|');
+  }
+
+  putStateIntoPool(key, duel, decision, history) {
+    if (!duel) return;
+    if (this.maxStatePoolSize <= 0) {
+      try {
+        duel.endDuel();
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    const old = this.statePool.get(key);
+    if (old?.duel && old.duel !== duel) {
+      try {
+        old.duel.endDuel();
+      } catch {
+        // ignore
+      }
+    }
+    this.statePool.set(key, {
+      duel,
+      decision,
+      history: history.map((x) => ({ ...x })),
+    });
+    this.statePoolOrder = this.statePoolOrder.filter((k) => k !== key);
+    this.statePoolOrder.push(key);
+    while (this.statePoolOrder.length > this.maxStatePoolSize) {
+      const evictKey = this.statePoolOrder.shift();
+      if (evictKey === undefined) break;
+      const entry = this.statePool.get(evictKey);
+      this.statePool.delete(evictKey);
+      if (!entry?.duel) continue;
+      try {
+        entry.duel.endDuel();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  takeStateFromPool(key) {
+    if (!this.statePool.has(key)) return null;
+    const entry = this.statePool.get(key);
+    this.statePool.delete(key);
+    this.statePoolOrder = this.statePoolOrder.filter((k) => k !== key);
+    return entry ?? null;
   }
 
   collectReplayResponse(entry) {
@@ -550,13 +650,24 @@ class DuelRunner {
   }
 
   destroyDuel() {
-    if (!this.duel) return;
-    try {
-      this.duel.endDuel();
-    } catch {
-      // ignore
+    if (this.duel) {
+      try {
+        this.duel.endDuel();
+      } catch {
+        // ignore
+      }
     }
     this.duel = null;
+    for (const entry of this.statePool.values()) {
+      if (!entry?.duel) continue;
+      try {
+        entry.duel.endDuel();
+      } catch {
+        // ignore
+      }
+    }
+    this.statePool.clear();
+    this.statePoolOrder = [];
   }
 
   loadDeck(duel, deck, opening, owner, player) {
@@ -681,9 +792,9 @@ class DuelRunner {
   restoreState(state) {
     if (Array.isArray(state?.history)) {
       const history = state.history.map((item) => ({ ...item }));
-      if (!this.duel) {
-        this.duel = this.createDuelInstance();
-      }
+      const currentKey = this.makeHistoryKey(this.actionHistory);
+      const targetKey = this.makeHistoryKey(history);
+      if (this.duel && currentKey === targetKey) return;
       if (this.restoreNativeSnapshotBase64(state.snapshotBase64)) {
         this.actionHistory = history;
         return;
@@ -696,12 +807,33 @@ class DuelRunner {
   }
 
   rebuildFromHistory(history) {
-    this.destroyDuel();
+    const targetHistory = history.map((item) => ({ ...item }));
+    const targetKey = this.makeHistoryKey(targetHistory);
+    const currentKey = this.makeHistoryKey(this.actionHistory);
+    if (this.duel && currentKey === targetKey) return;
+
+    if (this.duel) {
+      this.putStateIntoPool(currentKey, this.duel, this.currentDecision, this.actionHistory);
+      this.duel = null;
+      this.currentDecision = null;
+      this.actionHistory = [];
+    }
+
+    const pooled = this.takeStateFromPool(targetKey);
+    if (pooled?.duel) {
+      this.duel = pooled.duel;
+      this.currentDecision = pooled.decision;
+      this.actionHistory = Array.isArray(pooled.history)
+        ? pooled.history.map((item) => ({ ...item }))
+        : [];
+      return;
+    }
+
     this.duel = this.createDuelInstance();
     this.currentDecision = this.advanceUntilDecision();
     this.actionHistory = [];
 
-    for (const encoded of history) {
+    for (const encoded of targetHistory) {
       const action = this.decodeAction(encoded);
       if (typeof action.intResponse === 'number') {
         this.duel.setResponseInt(action.intResponse);
@@ -1072,36 +1204,66 @@ class DuelRunner {
   }
 }
 
-function sortCodesForKey(codes) {
-  return [...(codes ?? [])].map((x) => x >>> 0).sort((a, b) => a - b).join(',');
-}
+function makeExactStateKey(state, snapshot, decision) {
+  const sortCodes = (codes) =>
+    [...(codes ?? [])]
+      .map((x) => x >>> 0)
+      .sort((a, b) => a - b)
+      .join(',');
 
-function makeDecisionSig(decision) {
-  if (!decision?.actions?.length) return '';
-  return decision.actions
-    .slice(0, 8)
-    .map((a) => `${a.kind}:${a.label}`)
-    .join('^');
-}
+  const decisionSig = decision?.actions?.length
+    ? decision.actions
+        .slice(0, 12)
+        .map((action) => `${action.kind}:${action.label}`)
+        .join('^')
+    : decision?.message?.constructor?.name ?? decision?.reason ?? 'terminal';
 
-function makeStateKey(snapshot, stepType = 'terminal', decisionSig = '') {
   return [
-    snapshot.lp.p0,
-    snapshot.lp.p1,
-    sortCodesForKey(snapshot.p0.mzone),
-    sortCodesForKey(snapshot.p0.szone),
-    sortCodesForKey(snapshot.p0.hand),
-    sortCodesForKey(snapshot.p0.grave),
-    sortCodesForKey(snapshot.p1.mzone),
-    sortCodesForKey(snapshot.p1.szone),
-    sortCodesForKey(snapshot.p1.hand),
-    sortCodesForKey(snapshot.p1.grave),
-    stepType,
+    snapshot?.lp?.p0 ?? 0,
+    snapshot?.lp?.p1 ?? 0,
+    sortCodes(snapshot?.p0?.mzone),
+    sortCodes(snapshot?.p0?.szone),
+    sortCodes(snapshot?.p0?.hand),
+    sortCodes(snapshot?.p0?.grave),
+    sortCodes(snapshot?.p0?.banished),
+    sortCodes(snapshot?.p1?.mzone),
+    sortCodes(snapshot?.p1?.szone),
+    sortCodes(snapshot?.p1?.hand),
+    sortCodes(snapshot?.p1?.grave),
+    sortCodes(snapshot?.p1?.banished),
     decisionSig,
   ].join('|');
 }
 
-function searchTopLongestPaths(runner, opts) {
+function rankActionForLongestPath(action) {
+  const base = {
+    chain: 8,
+    activate: 7,
+    spsummon: 6,
+    summon: 5,
+    option: 4,
+    yes: 3,
+    attack: 2,
+    other: 1,
+    fallback: -2,
+    phase_end: -8,
+  }[action?.kind] ?? 0;
+
+  let score = base;
+  if (/^不/.test(action?.label ?? '')) score -= 2;
+  if ((action?.text ?? '').length > 0) score += 0.5;
+  return score;
+}
+
+function sortActionsForLongestPath(actions) {
+  return [...(actions ?? [])].sort(
+    (a, b) =>
+      rankActionForLongestPath(b) - rankActionForLongestPath(a) ||
+      String(a?.label ?? '').localeCompare(String(b?.label ?? ''), 'zh-Hans-CN'),
+  );
+}
+
+function searchTopLongestPathsExactSingle(runner, opts) {
   const best = {
     nodes: 0,
     terminalCount: 0,
@@ -1111,6 +1273,158 @@ function searchTopLongestPaths(runner, opts) {
   const progressEvery = Math.max(1, opts.progressEvery ?? 200);
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
   const rootState = runner.saveState();
+  const pathStateCounts = new Map();
+  const chain = [];
+  let lastReportedNodes = -1;
+
+  const settleTerminal = (chain, snapshotOverride = null, reasonHint = '', stateOverride = null) => {
+    const snapshot = snapshotOverride ?? runner.captureSnapshot();
+    const score = runner.scoreSnapshot(snapshot);
+    best.terminalCount += 1;
+    best.topPaths.push({
+      chain: chain.slice(),
+      depth: chain.length,
+      score,
+      reason: reasonHint,
+      snapshot,
+      state: stateOverride ? cloneHistoryState(stateOverride) : null,
+    });
+    best.topPaths.sort((a, b) => b.depth - a.depth || b.score - a.score);
+    if (best.topPaths.length > topK) best.topPaths.length = topK;
+  };
+
+  const maybeReportProgress = (currentDepth) => {
+    if (!onProgress) return;
+    if (best.nodes !== 0 && best.nodes % progressEvery !== 0 && best.nodes < opts.maxNodes) return;
+    if (best.nodes === lastReportedNodes) return;
+    lastReportedNodes = best.nodes;
+    onProgress({
+      nodes: best.nodes,
+      maxNodes: opts.maxNodes,
+      terminalCount: best.terminalCount,
+      currentDepth,
+      done: false,
+    });
+  };
+
+  const explore = (state, depth, sameKeyStreak = 0) => {
+    if (best.nodes >= opts.maxNodes) return;
+
+    runner.restoreState(state);
+    const snapshot = runner.captureSnapshot();
+    const current = runner.currentDecision;
+    const stateKey = makeExactStateKey(state, snapshot, current);
+
+    if (!current || current.terminal || !current.actions?.length) {
+      settleTerminal(chain, snapshot, current?.reason ?? 'NO_ACTION_OR_NULL', state);
+      return;
+    }
+    if (depth >= opts.maxDepth) {
+      settleTerminal(chain, snapshot, 'MAX_DEPTH', state);
+      return;
+    }
+
+    pathStateCounts.set(stateKey, (pathStateCounts.get(stateKey) ?? 0) + 1);
+    let exploredChild = false;
+
+    const nonEndActions = current.actions.filter((a) => a.kind !== 'phase_end');
+    const iterActions = sortActionsForLongestPath(
+      nonEndActions.length > 0 ? nonEndActions : current.actions,
+    );
+
+    for (const action of iterActions) {
+      if (best.nodes >= opts.maxNodes) break;
+
+      runner.step(action);
+      best.nodes += 1;
+      chain.push(action.label);
+
+      const childState = runner.saveState();
+      const childSnapshot = runner.captureSnapshot();
+      const childDecision = runner.currentDecision;
+      const childDepth = depth + 1;
+
+      if (action.kind === 'phase_end') {
+        exploredChild = true;
+        settleTerminal(chain, childSnapshot, 'TURN_END', childState);
+        runner.restoreState(state);
+        chain.pop();
+        maybeReportProgress(childDepth);
+        continue;
+      }
+
+      const childStateKey = makeExactStateKey(childState, childSnapshot, childDecision);
+      const childSameKeyStreak = childStateKey === stateKey ? sameKeyStreak + 1 : 0;
+      const childPathCount = pathStateCounts.get(childStateKey) ?? 0;
+      const skipBecauseLoop =
+        (childStateKey === stateKey && (action.kind === 'fallback' || action.label === '确认选择')) ||
+        childSameKeyStreak > 2 ||
+        childPathCount >= 3;
+
+      if (!skipBecauseLoop) {
+        exploredChild = true;
+        explore(childState, childDepth, childSameKeyStreak);
+      }
+
+      runner.restoreState(state);
+      chain.pop();
+      maybeReportProgress(childDepth);
+    }
+
+    const nextCount = (pathStateCounts.get(stateKey) ?? 1) - 1;
+    if (nextCount > 0) pathStateCounts.set(stateKey, nextCount);
+    else pathStateCounts.delete(stateKey);
+
+    if (!exploredChild) {
+      settleTerminal(
+        chain,
+        snapshot,
+        best.nodes >= opts.maxNodes ? 'MAX_NODES' : 'ALL_CHILDREN_PRUNED',
+        state,
+      );
+    }
+  };
+
+  runner.restoreState(rootState);
+  if (onProgress) {
+    onProgress({
+      nodes: best.nodes,
+      maxNodes: opts.maxNodes,
+      terminalCount: best.terminalCount,
+      currentDepth: 0,
+      done: false,
+    });
+  }
+
+  explore(rootState, 0);
+
+  runner.restoreState(rootState);
+  if (best.topPaths.length === 0) {
+    settleTerminal([], null, best.nodes >= opts.maxNodes ? 'MAX_NODES' : 'NO_RESULT', rootState);
+  }
+  if (onProgress) {
+    onProgress({
+      nodes: best.nodes,
+      maxNodes: opts.maxNodes,
+      terminalCount: best.terminalCount,
+      currentDepth: 0,
+      done: true,
+    });
+  }
+  return best;
+}
+
+function searchTopLongestPathsRandom(runner, opts) {
+  const best = {
+    nodes: 0,
+    terminalCount: 0,
+    topPaths: [],
+  };
+  const topK = Math.max(1, opts.topK ?? DEFAULT_OPTIONS.topK);
+  const progressEvery = Math.max(1, opts.progressEvery ?? 200);
+  const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+  const rootState = runner.saveState();
+  const rnd = makeXorshift32(((opts.seed ?? DEFAULT_OPTIONS.seed) ^ 0x85ebca6b) >>> 0);
 
   const settleTerminal = (chain, snapshotOverride = null, reasonHint = '', stateOverride = null) => {
     const snapshot = snapshotOverride ?? runner.captureSnapshot();
@@ -1129,130 +1443,73 @@ function searchTopLongestPaths(runner, opts) {
   };
 
   runner.restoreState(rootState);
-  const rootSnapshot = runner.captureSnapshot();
-  const rootStepType =
-    runner.currentDecision?.message?.constructor?.name ??
-    runner.currentDecision?.reason ??
-    'terminal';
-  const rootKey = makeStateKey(rootSnapshot, rootStepType, makeDecisionSig(runner.currentDecision));
-
-  const queue = [{
-    state: rootState,
-    chain: [],
-    depth: 0,
-    stateKey: rootKey,
-    sameKeyStreak: 0,
-  }];
-  let cursor = 0;
   if (onProgress) {
     onProgress({
       nodes: best.nodes,
       maxNodes: opts.maxNodes,
       terminalCount: best.terminalCount,
-      queueSize: queue.length - cursor,
+      currentDepth: 0,
       done: false,
     });
   }
 
-  while (cursor < queue.length && best.nodes < opts.maxNodes) {
-    const node = queue[cursor];
-    cursor += 1;
+  while (best.nodes < opts.maxNodes) {
+    runner.restoreState(rootState);
 
-    runner.restoreState(node.state);
-    const current = runner.currentDecision;
+    const chain = [];
+    let depth = 0;
+    let reason = 'NO_ACTION_OR_NULL';
 
-    if (!current || current.terminal || node.depth >= opts.maxDepth || !current.actions?.length) {
-      settleTerminal(
-        node.chain,
-        null,
-        current?.reason ??
-        (node.depth >= opts.maxDepth ? 'MAX_DEPTH' : 'NO_ACTION_OR_NULL'),
-        node.state,
-      );
-      continue;
-    }
+    while (depth < opts.maxDepth && best.nodes < opts.maxNodes) {
+      const current = runner.currentDecision;
+      if (!current || current.terminal || !current.actions?.length) {
+        reason = current?.reason ?? 'NO_ACTION_OR_NULL';
+        break;
+      }
 
-    const nonEndActions = current.actions.filter((a) => a.kind !== 'phase_end');
-    const iterActions = nonEndActions.length > 0 ? nonEndActions : current.actions;
-    let expanded = false;
+      const nonEndActions = current.actions.filter((a) => a.kind !== 'phase_end');
+      const iterActions = nonEndActions.length > 0 ? nonEndActions : current.actions;
+      if (!iterActions.length) {
+        reason = 'NO_ACTION_OR_NULL';
+        break;
+      }
 
-    for (const action of iterActions) {
-      if (best.nodes >= opts.maxNodes) break;
-
-      const parentState = runner.saveState();
+      const action = iterActions[Math.floor(rnd() * iterActions.length)];
       runner.step(action);
+      chain.push(action.label);
+      depth += 1;
       best.nodes += 1;
+
+      if (action.kind === 'phase_end') {
+        reason = 'TURN_END';
+        break;
+      }
+      if (depth >= opts.maxDepth) {
+        reason = 'MAX_DEPTH';
+        break;
+      }
+      const next = runner.currentDecision;
+      if (!next || next.terminal || !next.actions?.length) {
+        reason = next?.reason ?? 'NO_ACTION_OR_NULL';
+        break;
+      }
+
       if (onProgress && (best.nodes % progressEvery === 0 || best.nodes >= opts.maxNodes)) {
         onProgress({
           nodes: best.nodes,
           maxNodes: opts.maxNodes,
           terminalCount: best.terminalCount,
-          queueSize: queue.length - cursor,
+          currentDepth: depth,
           done: false,
         });
       }
-
-      const childChain = [...node.chain, action.label];
-      const snapshot = runner.captureSnapshot();
-      const childDepth = node.depth + 1;
-      const childDecision = runner.currentDecision;
-      const stopByTurnEnd = action.kind === 'phase_end';
-      const isTerminal =
-        stopByTurnEnd ||
-        !childDecision ||
-        childDecision.terminal ||
-        childDepth >= opts.maxDepth ||
-        !childDecision.actions?.length;
-
-      if (isTerminal) {
-        const terminalState = runner.saveState();
-        settleTerminal(
-          childChain,
-          snapshot,
-          stopByTurnEnd
-            ? 'TURN_END'
-            : childDecision?.reason ??
-              (childDepth >= opts.maxDepth ? 'MAX_DEPTH' : 'NO_ACTION_OR_NULL'),
-          terminalState,
-        );
-        runner.restoreState(parentState);
-        continue;
-      }
-
-      const stepType =
-        childDecision.message?.constructor?.name ??
-        childDecision.reason ??
-        'terminal';
-      const stateKey = makeStateKey(snapshot, stepType, makeDecisionSig(childDecision));
-      if (
-        stateKey === node.stateKey &&
-        (action.kind === 'fallback' || action.label === '确认选择')
-      ) {
-        runner.restoreState(parentState);
-        continue;
-      }
-      const sameKeyStreak = stateKey === node.stateKey ? node.sameKeyStreak + 1 : 0;
-      if (sameKeyStreak > 2) {
-        runner.restoreState(parentState);
-        continue;
-      }
-      expanded = true;
-
-      const childState = runner.saveState();
-      queue.push({
-        state: childState,
-        chain: childChain,
-        depth: childDepth,
-        stateKey,
-        sameKeyStreak,
-      });
-
-      runner.restoreState(parentState);
     }
 
-    if (!expanded) {
-      settleTerminal(node.chain, null, 'ALL_CHILDREN_PRUNED', node.state);
+    if (best.nodes >= opts.maxNodes && depth < opts.maxDepth && reason === 'NO_ACTION_OR_NULL') {
+      reason = 'MAX_NODES';
     }
+
+    settleTerminal(chain, null, reason, runner.saveState());
   }
 
   runner.restoreState(rootState);
@@ -1262,11 +1519,18 @@ function searchTopLongestPaths(runner, opts) {
       nodes: best.nodes,
       maxNodes: opts.maxNodes,
       terminalCount: best.terminalCount,
-      queueSize: queue.length - cursor,
+      currentDepth: 0,
       done: true,
     });
   }
   return best;
+}
+
+function searchTopLongestPaths(runner, opts) {
+  if (opts?.exactSingleSearch) {
+    return searchTopLongestPathsExactSingle(runner, opts);
+  }
+  return searchTopLongestPathsRandom(runner, opts);
 }
 
 async function createRuntime(cardsPath, scriptDirs) {
@@ -1313,7 +1577,7 @@ function resolveTopReplayOutputPaths(exportYrpArg, seed, topPathsCount) {
     depths.map((depth, idx) => path.join(resolved, `top${idx + 1}-depth${depth}.yrp`));
 }
 
-function renderProgressBar(nodes, maxNodes, queueSize, terminalCount) {
+function renderProgressBar(nodes, maxNodes, currentDepth, terminalCount) {
   const total = Math.max(1, maxNodes | 0);
   const value = Math.max(0, Math.min(total, nodes | 0));
   const ratio = value / total;
@@ -1321,7 +1585,7 @@ function renderProgressBar(nodes, maxNodes, queueSize, terminalCount) {
   const filled = Math.max(0, Math.min(width, Math.round(ratio * width)));
   const bar = `${'█'.repeat(filled)}${'░'.repeat(width - filled)}`;
   const percent = `${(ratio * 100).toFixed(1)}%`;
-  return `探索进度 [${bar}] ${percent} (${value}/${total}) | 队列:${Math.max(0, queueSize | 0)} | 终局:${Math.max(0, terminalCount | 0)}`;
+  return `探索进度 [${bar}] ${percent} (${value}/${total}) | 深度:${Math.max(0, currentDepth | 0)} | 终局:${Math.max(0, terminalCount | 0)}`;
 }
 
 async function main() {
@@ -1357,8 +1621,11 @@ async function main() {
   const maxNodes = toInt(args['max-nodes'], DEFAULT_OPTIONS.maxNodes);
   const maxBeamWidth = Math.max(1, toInt(args['beam-width'], DEFAULT_OPTIONS.maxBeamWidth));
   const maxActionsPerNode = toInt(args['max-actions'], DEFAULT_OPTIONS.maxActionsPerNode);
+  const snapshotPoolSize = toInt(args['snapshot-pool'], DEFAULT_OPTIONS.snapshotPoolSize);
   const topK = Math.max(1, toInt(args.top, DEFAULT_OPTIONS.topK));
   const expandScriptKeywords = parseKeywordList(args['expand-script-keywords']);
+  const openingCards = parseCodeList(args['opening-cards'], '--opening-cards');
+  const opponentOpeningCards = parseCodeList(args['opponent-opening-cards'], '--opponent-opening-cards');
   const exportYrpArg = args['export-yrp'];
   const yrpVersion = parseYrpVersion(args['yrp-version'], 1);
   const verbose = !!args.verbose;
@@ -1373,13 +1640,27 @@ async function main() {
   if (playerDeck.main.length < drawCount || opponentDeck.main.length < drawCount) {
     throw new Error(`主卡组数量不足以抽${drawCount}张起手`);
   }
+  if (openingCards.length > 0 && openingCards.length !== drawCount) {
+    throw new Error(`--opening-cards 数量(${openingCards.length}) 必须等于 --draw-count(${drawCount})`);
+  }
+  if (opponentOpeningCards.length > 0 && opponentOpeningCards.length !== drawCount) {
+    throw new Error(`--opponent-opening-cards 数量(${opponentOpeningCards.length}) 必须等于 --draw-count(${drawCount})`);
+  }
 
-  const playerOpening = simulateOpeningHand(playerDeck.main, drawCount, seed);
-  const opponentOpening = simulateOpeningHand(opponentDeck.main, drawCount, (seed ^ 0x9e3779b9) >>> 0);
+  const playerOpening =
+    openingCards.length > 0
+      ? buildFixedOpening(playerDeck.main, openingCards, '我方固定起手')
+      : simulateOpeningHand(playerDeck.main, drawCount, seed);
+  const opponentOpening =
+    opponentOpeningCards.length > 0
+      ? buildFixedOpening(opponentDeck.main, opponentOpeningCards, '对方固定起手')
+      : simulateOpeningHand(opponentDeck.main, drawCount, (seed ^ 0x9e3779b9) >>> 0);
+  const exactSingleSearch = playerOpening.opening.length === 1;
 
   console.log(`随机种子: ${seed}`);
   console.log(`我方起手(模拟抽${drawCount}): ${playerOpening.opening.join(', ')}`);
   console.log(`对方起手(模拟抽${drawCount}): ${opponentOpening.opening.join(', ')}`);
+  console.log(`搜索模式: ${exactSingleSearch ? '精确DFS(一卡起手)' : '随机搜索'}`);
 
   let runtime = null;
   let runner = null;
@@ -1395,6 +1676,7 @@ async function main() {
         maxBeamWidth,
         maxActionsPerNode,
         maxProcessPerStep: DEFAULT_OPTIONS.maxProcessPerStep,
+        snapshotPoolSize,
         expandScriptKeywords,
       },
       playerDeck,
@@ -1420,9 +1702,11 @@ async function main() {
       maxNodes,
       maxBeamWidth,
       topK,
+      seed,
+      exactSingleSearch,
       progressEvery: Math.max(50, Math.floor(maxNodes / 200)),
-      onProgress: ({ nodes, maxNodes: total, queueSize, terminalCount, done }) => {
-        const line = renderProgressBar(nodes, total, queueSize, terminalCount);
+      onProgress: ({ nodes, maxNodes: total, currentDepth, terminalCount, done }) => {
+        const line = renderProgressBar(nodes, total, currentDepth, terminalCount);
         if (process.stdout.isTTY) {
           process.stdout.write(`\r${line}${done ? '\n' : ''}`);
         } else if (done || nodes === 0 || nodes === total) {
@@ -1441,6 +1725,9 @@ async function main() {
       }
     });
     console.log(`\n搜索节点: ${result.nodes} | 终局分支: ${result.terminalCount}`);
+    if (result.nodes >= maxNodes) {
+      console.log('注意: 已触及 max-nodes，上面的最长路径仍可能被更深分支继续刷新。');
+    }
     if (verbose && result.topPaths[0]?.snapshot?.cardIdList) {
       const cardIdList = result.topPaths[0].snapshot.cardIdList;
       const cardIdListZh = {
