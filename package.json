@@ -5,10 +5,10 @@
   "type": "module",
   "scripts": {
     "simulate": "node combo-simulator.cjs",
-    "simulate:esm": "node combo-simulato.js"
+    "simulate:js": "node combo-simulato.js"
   },
   "dependencies": {
-    "koishipro-core.js": "^1.4.4",
+    "koishipro-core.js": "^1.4.5",
     "ygopro-cdb-encode": "^1.1.0",
     "ygopro-msg-encode": "^1.2.2",
     "ygopro-yrp-encode": "^1.0.1"
