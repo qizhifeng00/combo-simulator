@@ -83,21 +83,15 @@ const BATTLE_CMD = {
 
 const DEFAULT_OPTIONS = {
   drawCount: 1,
-  maxDepth: 300,
-  maxNodes: 10000,
+  maxDepth: 200,
+  maxNodes: 100000,
   maxBeamWidth: 20,
   maxActionsPerNode: 12,
   maxProcessPerStep: 2000,
   snapshotPoolSize: 512,
-  seed: Date.now() >>> 0,
+  seed:  2014839433,
   topK: 20,
 };
-
-const MODERN_SNAPSHOT_POOL_MAX_ENTRIES = 128;
-const MODERN_SNAPSHOT_POOL_MAX_BYTES = 96 * 1024 * 1024;
-const OCGCORE_SNAPSHOT_MAGIC = Uint8Array.from([0x4b, 0x4f, 0x43, 0x47, 0x53, 0x4e, 0x50, 0x31]);
-const OCGCORE_SNAPSHOT_HEADER_SIZE = OCGCORE_SNAPSHOT_MAGIC.length + 4;
-const UTF8_DECODER = new TextDecoder('utf-8');
 
 const DEFAULT_LIB_DIR = path.join(process.cwd(), 'lib');
 const DEFAULT_LOCAL_FILES = {
@@ -211,9 +205,6 @@ function cloneHistoryState(state) {
   const out = {
     history: state.history.map((item) => ({ ...item })),
   };
-  if (typeof state.historyKey === 'string' && state.historyKey) {
-    out.historyKey = state.historyKey;
-  }
   if (typeof state.snapshotBase64 === 'string' && state.snapshotBase64) {
     out.snapshotBase64 = state.snapshotBase64;
   }
@@ -230,56 +221,6 @@ function encodedActionToReplayResponse(action) {
     return Uint8Array.from(Buffer.from(action.responseBase64, 'base64'));
   }
   return new Uint8Array(0);
-}
-
-function toUint8Array(raw) {
-  if (raw instanceof Uint8Array) return raw;
-  if (Array.isArray(raw)) return Uint8Array.from(raw);
-  if (!raw) return null;
-  return null;
-}
-
-function decodeOcgcoreDuelSnapshotBytes(input) {
-  if (!(input instanceof Uint8Array) || input.length < OCGCORE_SNAPSHOT_HEADER_SIZE) {
-    throw new Error('Invalid ocgcore duel snapshot: truncated header');
-  }
-  for (let i = 0; i < OCGCORE_SNAPSHOT_MAGIC.length; i += 1) {
-    if (input[i] !== OCGCORE_SNAPSHOT_MAGIC[i]) {
-      throw new Error('Invalid ocgcore duel snapshot: bad magic');
-    }
-  }
-  const view = new DataView(input.buffer, input.byteOffset, input.byteLength);
-  const metadataLength = view.getUint32(OCGCORE_SNAPSHOT_MAGIC.length, true);
-  const memoryOffset = OCGCORE_SNAPSHOT_HEADER_SIZE + metadataLength;
-  if (memoryOffset > input.byteLength) {
-    throw new Error('Invalid ocgcore duel snapshot: truncated metadata');
-  }
-  const metadataText = UTF8_DECODER.decode(input.subarray(OCGCORE_SNAPSHOT_HEADER_SIZE, memoryOffset));
-  const metadata = JSON.parse(metadataText);
-  const memory = input.subarray(memoryOffset);
-  if (
-    !metadata ||
-    !Number.isSafeInteger(metadata.memoryByteLength) ||
-    metadata.memoryByteLength !== memory.byteLength
-  ) {
-    throw new Error('Invalid ocgcore duel snapshot: memory length mismatch');
-  }
-  if (!metadata.duel || !metadata.wrapper) {
-    throw new Error('Invalid ocgcore duel snapshot: missing state');
-  }
-  return { metadata, memory };
-}
-
-function ensureOcgcoreModuleMemoryCapacity(moduleInstance, byteLength) {
-  while ((moduleInstance?.HEAPU8?.byteLength ?? 0) < byteLength) {
-    const before = moduleInstance.HEAPU8.byteLength;
-    const ptr = moduleInstance._malloc(byteLength);
-    if (ptr) moduleInstance._free(ptr);
-    const after = moduleInstance.HEAPU8.byteLength;
-    if (after <= before) {
-      throw new Error('Unable to grow ocgcore wasm memory for snapshot restore');
-    }
-  }
 }
 
 function makeSeedSequence(seed, count = 8) {
@@ -545,19 +486,12 @@ class CardTextResolver {
     const card = this.getCard(code);
     const id = Number(descId) >>> 0;
     const candidates = [];
-
-    // aux.Stringid(cardId, n) => cardId * 16 + n, where n is 0-based.
-    const auxBase = (card.id * 16) >>> 0;
-    const auxOffset = id - auxBase;
-    if (auxOffset >= 0 && auxOffset < 16) candidates.push(auxOffset + 1);
-
-    // Fallback decoders for environments that pass compact desc ids.
     const lowNibble = id & 0xf;
-    if (lowNibble >= 0 && lowNibble < 16) candidates.push(lowNibble + 1);
+    if (lowNibble > 0) candidates.push(lowNibble);
     const lowByte = id & 0xff;
-    if (lowByte > 0 && lowByte <= 16) candidates.push(lowByte);
+    if (lowByte > 0) candidates.push(lowByte);
     const shifted = id >>> 4;
-    if (shifted > 0 && shifted <= 16) candidates.push(shifted);
+    if (shifted > 0 && shifted < 64) candidates.push(shifted);
 
     for (const idx of uniq(candidates)) {
       if (card.effectByIndex[idx]) return card.effectByIndex[idx];
@@ -591,15 +525,6 @@ class DuelRunner {
     this.statePool = new Map();
     this.statePoolOrder = [];
     this.maxStatePoolSize = Math.max(0, this.config.snapshotPoolSize ?? DEFAULT_OPTIONS.snapshotPoolSize);
-    this.nativeSnapshotMode = 'unknown';
-    this.nativeSnapshotPool = new Map();
-    this.nativeSnapshotPoolOrder = [];
-    this.nativeSnapshotPoolBytes = 0;
-    this.maxNativeSnapshotPoolSize = Math.max(
-      0,
-      Math.min(this.maxStatePoolSize, MODERN_SNAPSHOT_POOL_MAX_ENTRIES),
-    );
-    this.maxNativeSnapshotPoolBytes = MODERN_SNAPSHOT_POOL_MAX_BYTES;
 
     this.classes = {
       Response: ygopro.YGOProMsgResponseBase,
@@ -615,21 +540,6 @@ class DuelRunner {
       SelectDisField: ygopro.YGOProMsgSelectDisField,
       SelectPosition: ygopro.YGOProMsgSelectPosition,
       SelectUnselect: ygopro.YGOProMsgSelectUnselectCard,
-    };
-    this.classNames = {
-      Response: 'YGOProMsgResponseBase',
-      Retry: 'YGOProMsgRetry',
-      SelectIdle: 'YGOProMsgSelectIdleCmd',
-      SelectBattle: 'YGOProMsgSelectBattleCmd',
-      SelectChain: 'YGOProMsgSelectChain',
-      SelectCard: 'YGOProMsgSelectCard',
-      SelectOption: 'YGOProMsgSelectOption',
-      SelectYesNo: 'YGOProMsgSelectYesNo',
-      SelectEffectYn: 'YGOProMsgSelectEffectYn',
-      SelectPlace: 'YGOProMsgSelectPlace',
-      SelectDisField: 'YGOProMsgSelectDisField',
-      SelectPosition: 'YGOProMsgSelectPosition',
-      SelectUnselect: 'YGOProMsgSelectUnselectCard',
     };
   }
 
@@ -648,114 +558,7 @@ class DuelRunner {
       .join('|');
   }
 
-  detectNativeSnapshotMode() {
-    if (!this.duel) {
-      if (this.nativeSnapshotMode === 'legacy' || this.nativeSnapshotMode === 'modern') {
-        return this.nativeSnapshotMode;
-      }
-      return 'none';
-    }
-    if (
-      this.duel &&
-      typeof this.duel.saveState === 'function' &&
-      typeof this.duel.loadState === 'function'
-    ) {
-      return 'legacy';
-    }
-    if (
-      this.duel &&
-      typeof this.duel.snapshot === 'function' &&
-      this.wrapper &&
-      this.wrapper.ocgcoreModule &&
-      typeof this.wrapper.attachDuel === 'function' &&
-      typeof this.wrapper.restoreSnapshotState === 'function'
-    ) {
-      return 'modern';
-    }
-    return 'none';
-  }
-
-  ensureNativeSnapshotMode() {
-    const mode = this.detectNativeSnapshotMode();
-    if (this.nativeSnapshotMode !== mode) {
-      this.nativeSnapshotMode = mode;
-      if (mode !== 'modern') {
-        this.clearNativeSnapshotPool();
-      } else {
-        this.clearStatePool();
-      }
-    }
-    return this.nativeSnapshotMode;
-  }
-
-  clearNativeSnapshotPool() {
-    this.nativeSnapshotPool.clear();
-    this.nativeSnapshotPoolOrder = [];
-    this.nativeSnapshotPoolBytes = 0;
-  }
-
-  clearStatePool() {
-    for (const entry of this.statePool.values()) {
-      if (!entry?.duel) continue;
-      try {
-        entry.duel.endDuel();
-      } catch {
-        // ignore
-      }
-    }
-    this.statePool.clear();
-    this.statePoolOrder = [];
-  }
-
-  touchNativeSnapshotPoolKey(key) {
-    if (typeof key !== 'string') return;
-    if (!this.nativeSnapshotPool.has(key)) return;
-    this.nativeSnapshotPoolOrder = this.nativeSnapshotPoolOrder.filter((k) => k !== key);
-    this.nativeSnapshotPoolOrder.push(key);
-  }
-
-  putNativeSnapshotIntoPool(key, snapshotBytes) {
-    if (typeof key !== 'string' || this.ensureNativeSnapshotMode() !== 'modern') return;
-    if (this.maxNativeSnapshotPoolSize <= 0 || this.maxNativeSnapshotPoolBytes <= 0) return;
-    const bytes = toUint8Array(snapshotBytes);
-    if (!bytes || bytes.length === 0) return;
-    if (bytes.length > this.maxNativeSnapshotPoolBytes) return;
-
-    const old = this.nativeSnapshotPool.get(key);
-    if (old?.bytes) {
-      this.nativeSnapshotPoolBytes = Math.max(0, this.nativeSnapshotPoolBytes - old.bytes.length);
-    }
-
-    const frozenBytes = Uint8Array.from(bytes);
-    this.nativeSnapshotPool.set(key, { bytes: frozenBytes });
-    this.nativeSnapshotPoolBytes += frozenBytes.length;
-    this.touchNativeSnapshotPoolKey(key);
-
-    while (
-      this.nativeSnapshotPoolOrder.length > this.maxNativeSnapshotPoolSize ||
-      this.nativeSnapshotPoolBytes > this.maxNativeSnapshotPoolBytes
-    ) {
-      const evictKey = this.nativeSnapshotPoolOrder.shift();
-      if (evictKey === undefined) break;
-      const entry = this.nativeSnapshotPool.get(evictKey);
-      this.nativeSnapshotPool.delete(evictKey);
-      if (entry?.bytes) {
-        this.nativeSnapshotPoolBytes = Math.max(0, this.nativeSnapshotPoolBytes - entry.bytes.length);
-      }
-    }
-  }
-
-  getNativeSnapshotFromPool(key) {
-    if (typeof key !== 'string') return null;
-    if (this.ensureNativeSnapshotMode() !== 'modern') return null;
-    if (!this.nativeSnapshotPool.has(key)) return null;
-    const entry = this.nativeSnapshotPool.get(key);
-    this.touchNativeSnapshotPoolKey(key);
-    return entry?.bytes ?? null;
-  }
-
   putStateIntoPool(key, duel, decision, history) {
-    if (this.ensureNativeSnapshotMode() === 'modern') return;
     if (!duel) return;
     if (this.maxStatePoolSize <= 0) {
       try {
@@ -795,7 +598,6 @@ class DuelRunner {
   }
 
   takeStateFromPool(key) {
-    if (this.ensureNativeSnapshotMode() === 'modern') return null;
     if (!this.statePool.has(key)) return null;
     const entry = this.statePool.get(key);
     this.statePool.delete(key);
@@ -856,8 +658,16 @@ class DuelRunner {
       }
     }
     this.duel = null;
-    this.clearStatePool();
-    this.clearNativeSnapshotPool();
+    for (const entry of this.statePool.values()) {
+      if (!entry?.duel) continue;
+      try {
+        entry.duel.endDuel();
+      } catch {
+        // ignore
+      }
+    }
+    this.statePool.clear();
+    this.statePoolOrder = [];
   }
 
   loadDeck(duel, deck, opening, owner, player) {
@@ -933,78 +743,36 @@ class DuelRunner {
   }
 
   hasNativeSnapshotApi() {
-    const mode = this.ensureNativeSnapshotMode();
-    return mode === 'legacy' || mode === 'modern';
-  }
-
-  captureNativeSnapshotBytes() {
-    const mode = this.ensureNativeSnapshotMode();
-    if (!this.duel || mode === 'none') return null;
-    try {
-      if (mode === 'legacy') {
-        return toUint8Array(this.duel.saveState());
-      }
-      if (mode === 'modern') {
-        return toUint8Array(this.duel.snapshot());
-      }
-    } catch {
-      return null;
-    }
-    return null;
+    return (
+      this.duel &&
+      typeof this.duel.saveState === 'function' &&
+      typeof this.duel.loadState === 'function'
+    );
   }
 
   captureNativeSnapshotBase64() {
-    const bytes = this.captureNativeSnapshotBytes();
-    if (!bytes || bytes.length === 0) return '';
-    return Buffer.from(bytes).toString('base64');
+    if (!this.hasNativeSnapshotApi()) return '';
+    try {
+      const raw = this.duel.saveState();
+      const bytes =
+        raw instanceof Uint8Array
+          ? raw
+          : Array.isArray(raw)
+          ? Uint8Array.from(raw)
+          : null;
+      if (!bytes || bytes.length === 0) return '';
+      return Buffer.from(bytes).toString('base64');
+    } catch {
+      return '';
+    }
   }
 
-  restoreModernSnapshotBytes(snapshotBytes) {
-    const bytes = toUint8Array(snapshotBytes);
-    if (!bytes || bytes.length === 0) return false;
-    if (this.ensureNativeSnapshotMode() !== 'modern') return false;
-    if (
-      !this.wrapper ||
-      !this.wrapper.ocgcoreModule ||
-      typeof this.wrapper.attachDuel !== 'function' ||
-      typeof this.wrapper.restoreSnapshotState !== 'function'
-    ) {
-      return false;
-    }
-
-    let decoded;
+  restoreNativeSnapshotBase64(snapshotBase64) {
+    if (!snapshotBase64 || !this.hasNativeSnapshotApi()) return false;
     try {
-      decoded = decodeOcgcoreDuelSnapshotBytes(bytes);
-    } catch {
-      return false;
-    }
-
-    try {
-      if (this.duel) {
-        try {
-          this.duel.endDuel();
-        } catch {
-          // ignore
-        }
-      }
-      this.duel = null;
-      this.currentDecision = null;
-      this.actionHistory = [];
-      this.clearStatePool();
-
-      ensureOcgcoreModuleMemoryCapacity(
-        this.wrapper.ocgcoreModule,
-        decoded.metadata.memoryByteLength,
-      );
-      const heap = this.wrapper.ocgcoreModule.HEAPU8;
-      if (!(heap instanceof Uint8Array)) return false;
-      heap.set(decoded.memory, 0);
-      this.wrapper.restoreSnapshotState(decoded.metadata.wrapper);
-      this.duel = this.wrapper.attachDuel(
-        decoded.metadata.duel.duelPtr,
-        decoded.metadata.duel,
-      );
-      this.ensureNativeSnapshotMode();
+      const bytes = Uint8Array.from(Buffer.from(snapshotBase64, 'base64'));
+      if (bytes.length === 0) return false;
+      this.duel.loadState(bytes);
       this.currentDecision = this.advanceUntilDecision();
       return true;
     } catch {
@@ -1012,66 +780,12 @@ class DuelRunner {
     }
   }
 
-  restoreNativeSnapshotBytes(snapshotBytes) {
-    const bytes = toUint8Array(snapshotBytes);
-    if (!bytes || bytes.length === 0) return false;
-    const mode = this.ensureNativeSnapshotMode();
-    if (mode === 'legacy') {
-      if (!this.duel || typeof this.duel.loadState !== 'function') return false;
-      try {
-        this.duel.loadState(bytes);
-        this.currentDecision = this.advanceUntilDecision();
-        return true;
-      } catch {
-        return false;
-      }
-    }
-    if (mode === 'modern') {
-      return this.restoreModernSnapshotBytes(bytes);
-    }
-    return false;
-  }
-
-  restoreNativeSnapshotBase64(snapshotBase64) {
-    if (!snapshotBase64) return false;
-    try {
-      const bytes = Uint8Array.from(Buffer.from(snapshotBase64, 'base64'));
-      return this.restoreNativeSnapshotBytes(bytes);
-    } catch {
-      return false;
-    }
-  }
-
-  tryRestoreNativeSnapshotFromPool(key) {
-    if (typeof key !== 'string') return false;
-    const snapshotBytes = this.getNativeSnapshotFromPool(key);
-    if (!snapshotBytes) return false;
-    return this.restoreNativeSnapshotBytes(snapshotBytes);
-  }
-
   saveState() {
-    const history = this.actionHistory.map((item) => ({ ...item }));
-    const historyKey = this.makeHistoryKey(history);
     const state = {
-      history,
-      historyKey,
+      history: this.actionHistory.map((item) => ({ ...item })),
     };
-    const snapshotMode = this.ensureNativeSnapshotMode();
-    if (snapshotMode === 'legacy') {
-      const snapshotBase64 = this.captureNativeSnapshotBase64();
-      if (snapshotBase64) state.snapshotBase64 = snapshotBase64;
-      return state;
-    }
-    if (snapshotMode === 'modern' && typeof historyKey === 'string') {
-      if (this.nativeSnapshotPool.has(historyKey)) {
-        this.touchNativeSnapshotPoolKey(historyKey);
-        return state;
-      }
-      const snapshotBytes = this.captureNativeSnapshotBytes();
-      if (snapshotBytes && snapshotBytes.length > 0) {
-        this.putNativeSnapshotIntoPool(historyKey, snapshotBytes);
-      }
-    }
+    const snapshotBase64 = this.captureNativeSnapshotBase64();
+    if (snapshotBase64) state.snapshotBase64 = snapshotBase64;
     return state;
   }
 
@@ -1079,16 +793,9 @@ class DuelRunner {
     if (Array.isArray(state?.history)) {
       const history = state.history.map((item) => ({ ...item }));
       const currentKey = this.makeHistoryKey(this.actionHistory);
-      const targetKey =
-        typeof state.historyKey === 'string' && state.historyKey
-          ? state.historyKey
-          : this.makeHistoryKey(history);
+      const targetKey = this.makeHistoryKey(history);
       if (this.duel && currentKey === targetKey) return;
       if (this.restoreNativeSnapshotBase64(state.snapshotBase64)) {
-        this.actionHistory = history;
-        return;
-      }
-      if (this.tryRestoreNativeSnapshotFromPool(targetKey)) {
         this.actionHistory = history;
         return;
       }
@@ -1106,15 +813,7 @@ class DuelRunner {
     if (this.duel && currentKey === targetKey) return;
 
     if (this.duel) {
-      if (this.ensureNativeSnapshotMode() === 'modern') {
-        try {
-          this.duel.endDuel();
-        } catch {
-          // ignore
-        }
-      } else {
-        this.putStateIntoPool(currentKey, this.duel, this.currentDecision, this.actionHistory);
-      }
+      this.putStateIntoPool(currentKey, this.duel, this.currentDecision, this.actionHistory);
       this.duel = null;
       this.currentDecision = null;
       this.actionHistory = [];
@@ -1127,14 +826,12 @@ class DuelRunner {
       this.actionHistory = Array.isArray(pooled.history)
         ? pooled.history.map((item) => ({ ...item }))
         : [];
-      this.ensureNativeSnapshotMode();
       return;
     }
 
     this.duel = this.createDuelInstance();
     this.currentDecision = this.advanceUntilDecision();
     this.actionHistory = [];
-    this.ensureNativeSnapshotMode();
 
     for (const encoded of targetHistory) {
       const action = this.decodeAction(encoded);
@@ -1181,7 +878,7 @@ class DuelRunner {
       // ignore
     }
 
-    if (this.isMsgType(msg, 'SelectOption')) {
+    if (msg instanceof this.classes.SelectOption) {
       const val = msg.options?.[0] ?? 0;
       try {
         return sendResponse(msg.prepareResponse(val));
@@ -1192,27 +889,6 @@ class DuelRunner {
         return sendResponse(msg.prepareResponse(0));
       } catch {
         // ignore
-      }
-    }
-
-    const autoActions = this.enumerateActions(msg, { keepRepositionSet: true });
-    if (autoActions.length > 0) {
-      const preferred =
-        autoActions.find((a) => a.kind === 'phase_end') ??
-        autoActions.find((a) => a.kind === 'other') ??
-        autoActions[0];
-      if (typeof preferred?.intResponse === 'number') {
-        try {
-          return sendInt(preferred.intResponse);
-        } catch {
-          // ignore
-        }
-      } else if (preferred?.response) {
-        try {
-          return sendResponse(preferred.response);
-        } catch {
-          // ignore
-        }
       }
     }
 
@@ -1236,10 +912,10 @@ class DuelRunner {
           : [];
 
       for (const msg of messages) {
-        if (this.isMsgType(msg, 'Retry')) {
+        if (msg instanceof this.classes.Retry) {
           return { terminal: true, reason: 'MSG_RETRY', actions: [] };
         }
-        if (this.isDecisionMessage(msg)) {
+        if (msg instanceof this.classes.Response) {
           const responsePlayer = typeof msg.responsePlayer === 'function' ? msg.responsePlayer() : 0;
           if (responsePlayer !== 0) {
             if (!this.autoRespond(msg)) return { terminal: true, reason: 'AUTO_RESPONSE_FAIL', actions: [] };
@@ -1270,21 +946,7 @@ class DuelRunner {
     };
   }
 
-  isMsgType(msg, key) {
-    if (!msg || !key) return false;
-    const Ctor = this.classes[key];
-    if (Ctor && msg instanceof Ctor) return true;
-    const expectedName = this.classNames[key];
-    return !!expectedName && msg?.constructor?.name === expectedName;
-  }
-
-  isDecisionMessage(msg) {
-    if (!msg || this.isMsgType(msg, 'Retry')) return false;
-    if (this.isMsgType(msg, 'Response')) return true;
-    return typeof msg.prepareResponse === 'function';
-  }
-
-  enumerateActions(msg, options = {}) {
+  enumerateActions(msg) {
     const actions = [];
     const add = (action) => {
       if (action) actions.push(action);
@@ -1293,7 +955,7 @@ class DuelRunner {
     const effectText = (code, desc) =>
       `${this.cardText.getDescription(code)} ${this.cardText.getEffectDescription(code, desc)}`.trim();
 
-    if (this.isMsgType(msg, 'SelectIdle')) {
+    if (msg instanceof this.classes.SelectIdle) {
       for (const card of msg.summonableCards ?? []) {
         add(this.makeAction({
           label: `通常召唤[${cardName(card.code)}]`,
@@ -1349,7 +1011,7 @@ class DuelRunner {
       if (msg.canEp) {
         add(this.makeAction({ label: '结束回合', kind: 'phase_end', response: msg.prepareResponse(IDLE_CMD.TO_EP), text: '' }));
       }
-    } else if (this.isMsgType(msg, 'SelectBattle')) {
+    } else if (msg instanceof this.classes.SelectBattle) {
       for (const card of msg.activatableCards ?? []) {
         const effect = trimText(this.cardText.getEffectDescription(card.code, card.desc), 18);
         add(this.makeAction({
@@ -1373,7 +1035,7 @@ class DuelRunner {
       if (msg.canEp) {
         add(this.makeAction({ label: '战阶结束', kind: 'phase_end', response: msg.prepareResponse(BATTLE_CMD.TO_EP), text: '' }));
       }
-    } else if (this.isMsgType(msg, 'SelectChain')) {
+    } else if (msg instanceof this.classes.SelectChain) {
       for (const chain of msg.chains ?? []) {
         const effect = trimText(this.cardText.getEffectDescription(chain.code, chain.desc), 18);
         add(this.makeAction({
@@ -1385,14 +1047,14 @@ class DuelRunner {
       }
       const def = msg.defaultResponse?.();
       if (def) add(this.makeAction({ label: '不连锁', kind: 'other', response: def, text: '' }));
-    } else if (this.isMsgType(msg, 'SelectEffectYn')) {
+    } else if (msg instanceof this.classes.SelectEffectYn) {
       const text = effectText(msg.code, msg.desc);
       add(this.makeAction({ label: `发动[${cardName(msg.code)}]`, kind: 'activate', response: msg.prepareResponse(true), text }));
       add(this.makeAction({ label: `不发动[${cardName(msg.code)}]`, kind: 'other', response: msg.prepareResponse(false), text: '' }));
-    } else if (this.isMsgType(msg, 'SelectYesNo')) {
+    } else if (msg instanceof this.classes.SelectYesNo) {
       add(this.makeAction({ label: '选择[是]', kind: 'yes', response: msg.prepareResponse(true), text: '' }));
       add(this.makeAction({ label: '选择[否]', kind: 'other', response: msg.prepareResponse(false), text: '' }));
-    } else if (this.isMsgType(msg, 'SelectOption')) {
+    } else if (msg instanceof this.classes.SelectOption) {
       for (let i = 0; i < (msg.options?.length ?? 0); i += 1) {
         const optionValue = msg.options[i];
         try {
@@ -1415,11 +1077,11 @@ class DuelRunner {
           }
         }
       }
-    } else if (this.isMsgType(msg, 'SelectCard')) {
+    } else if (msg instanceof this.classes.SelectCard) {
       const min = Math.max(1, msg.min ?? 1);
       const cards = msg.cards ?? [];
       if (min <= 1) {
-        for (const c of cards.slice(0, 20)) {
+        for (const c of cards.slice(0, 6)) {
           add(this.makeAction({
             label: `选择卡片[${cardName(c.code)}]`,
             kind: 'other',
@@ -1438,7 +1100,7 @@ class DuelRunner {
           }));
         }
       }
-    } else if (this.isMsgType(msg, 'SelectPlace') || this.isMsgType(msg, 'SelectDisField')) {
+    } else if (msg instanceof this.classes.SelectPlace || msg instanceof this.classes.SelectDisField) {
       const places = msg.getSelectablePlaces?.() ?? [];
       const need = Math.max(1, msg.count ?? 1);
       if (places.length >= need) {
@@ -1449,16 +1111,16 @@ class DuelRunner {
           text: '',
         }));
       }
-    } else if (this.isMsgType(msg, 'SelectPosition')) {
+    } else if (msg instanceof this.classes.SelectPosition) {
       const POS = [1, 2, 4, 8];
       for (const p of POS) {
         if ((msg.positions & p) !== 0) {
           add(this.makeAction({ label: `选择表示形式(${p})`, kind: 'other', response: msg.prepareResponse(p), text: '' }));
         }
       }
-    } else if (this.isMsgType(msg, 'SelectUnselect')) {
+    } else if (msg instanceof this.classes.SelectUnselect) {
       const selectable = msg.selectableCards ?? [];
-      for (const c of selectable.slice(0, 20)) {
+      for (const c of selectable.slice(0, 6)) {
         add(this.makeAction({
           label: `选择卡片[${cardName(c.code)}]`,
           kind: 'other',
@@ -1485,11 +1147,6 @@ class DuelRunner {
       else add(this.makeAction({ label: `整数响应0[${msg.constructor.name}]`, kind: 'fallback', intResponse: 0, text: '' }));
     }
 
-    const keepRepositionSet = !!options.keepRepositionSet;
-    if (keepRepositionSet) {
-      return actions.slice(0, this.config.maxActionsPerNode);
-    }
-
     const scriptKeywords = this.config.expandScriptKeywords ?? [];
     const filtered = actions.filter((action) => {
       if (action.kind !== 'reposition' && action.kind !== 'set') return true;
@@ -1498,10 +1155,7 @@ class DuelRunner {
       return scriptKeywords.some((kw) => haystack.includes(String(kw).toLowerCase()));
     });
 
-    const picked =
-      filtered.length > 0
-        ? filtered
-        : actions.filter((a) => a.kind !== 'reposition' && a.kind !== 'set');
+    const picked = filtered.length > 0 ? filtered : actions.filter((a) => a.kind !== 'reposition' && a.kind !== 'set');
     return picked.slice(0, this.config.maxActionsPerNode);
   }
 
@@ -1581,35 +1235,6 @@ function makeExactStateKey(state, snapshot, decision) {
   ].join('|');
 }
 
-function makeExactStateKeyNoLp(state, snapshot, decision) {
-  const sortCodes = (codes) =>
-    [...(codes ?? [])]
-      .map((x) => x >>> 0)
-      .sort((a, b) => a - b)
-      .join(',');
-
-  const decisionSig = decision?.actions?.length
-    ? decision.actions
-        .slice(0, 12)
-        .map((action) => `${action.kind}:${action.label}`)
-        .join('^')
-    : decision?.message?.constructor?.name ?? decision?.reason ?? 'terminal';
-
-  return [
-    sortCodes(snapshot?.p0?.mzone),
-    sortCodes(snapshot?.p0?.szone),
-    sortCodes(snapshot?.p0?.hand),
-    sortCodes(snapshot?.p0?.grave),
-    sortCodes(snapshot?.p0?.banished),
-    sortCodes(snapshot?.p1?.mzone),
-    sortCodes(snapshot?.p1?.szone),
-    sortCodes(snapshot?.p1?.hand),
-    sortCodes(snapshot?.p1?.grave),
-    sortCodes(snapshot?.p1?.banished),
-    decisionSig,
-  ].join('|');
-}
-
 function rankActionForLongestPath(action) {
   const base = {
     chain: 8,
@@ -1648,10 +1273,8 @@ function searchTopLongestPathsExactSingle(runner, opts) {
   const progressEvery = Math.max(1, opts.progressEvery ?? 200);
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
   const balanceCardChoiceMaxDepth = Math.max(0, opts.balanceCardChoiceMaxDepth ?? 8);
-  const maxSameNoLpStateVisits = Math.max(1, opts.maxSameNoLpStateVisits ?? 2);
   const rootState = runner.saveState();
   const pathStateCounts = new Map();
-  const pathStateCountsNoLp = new Map();
   const chain = [];
   let lastReportedNodes = -1;
 
@@ -1692,7 +1315,6 @@ function searchTopLongestPathsExactSingle(runner, opts) {
     const snapshot = runner.captureSnapshot();
     const current = runner.currentDecision;
     const stateKey = makeExactStateKey(state, snapshot, current);
-    const stateKeyNoLp = makeExactStateKeyNoLp(state, snapshot, current);
 
     if (!current || current.terminal || !current.actions?.length) {
       settleTerminal(chain, snapshot, current?.reason ?? 'NO_ACTION_OR_NULL', state);
@@ -1704,7 +1326,6 @@ function searchTopLongestPathsExactSingle(runner, opts) {
     }
 
     pathStateCounts.set(stateKey, (pathStateCounts.get(stateKey) ?? 0) + 1);
-    pathStateCountsNoLp.set(stateKeyNoLp, (pathStateCountsNoLp.get(stateKeyNoLp) ?? 0) + 1);
     let exploredChild = false;
 
     const nonEndActions = current.actions.filter((a) => a.kind !== 'phase_end');
@@ -1734,15 +1355,12 @@ function searchTopLongestPathsExactSingle(runner, opts) {
       }
 
       const childStateKey = makeExactStateKey(childState, childSnapshot, childDecision);
-      const childStateKeyNoLp = makeExactStateKeyNoLp(childState, childSnapshot, childDecision);
       const childSameKeyStreak = childStateKey === stateKey ? sameKeyStreak + 1 : 0;
       const childPathCount = pathStateCounts.get(childStateKey) ?? 0;
-      const childPathCountNoLp = pathStateCountsNoLp.get(childStateKeyNoLp) ?? 0;
       const skipBecauseLoop =
         (childStateKey === stateKey && (action.kind === 'fallback' || action.label === '确认选择')) ||
         childSameKeyStreak > 2 ||
-        childPathCount >= 3 ||
-        childPathCountNoLp >= maxSameNoLpStateVisits;
+        childPathCount >= 3;
 
       if (!skipBecauseLoop) {
         exploredChild = true;
@@ -1754,6 +1372,7 @@ function searchTopLongestPathsExactSingle(runner, opts) {
       maybeReportProgress(childDepth);
     };
 
+    // 先广后深：在早期“选择卡片”分支先均分节点预算，避免第一条分支吃满 maxNodes。
     const shouldBalanceCardChoices =
       depth <= balanceCardChoiceMaxDepth &&
       iterActions.length > 1 &&
@@ -1777,9 +1396,6 @@ function searchTopLongestPathsExactSingle(runner, opts) {
     const nextCount = (pathStateCounts.get(stateKey) ?? 1) - 1;
     if (nextCount > 0) pathStateCounts.set(stateKey, nextCount);
     else pathStateCounts.delete(stateKey);
-    const nextNoLpCount = (pathStateCountsNoLp.get(stateKeyNoLp) ?? 1) - 1;
-    if (nextNoLpCount > 0) pathStateCountsNoLp.set(stateKeyNoLp, nextNoLpCount);
-    else pathStateCountsNoLp.delete(stateKeyNoLp);
 
     if (!exploredChild) {
       settleTerminal(
@@ -1860,7 +1476,6 @@ function searchTopLongestPathsRandom(runner, opts) {
   }
 
   while (best.nodes < opts.maxNodes) {
-    const nodesBeforeRound = best.nodes;
     runner.restoreState(rootState);
 
     const chain = [];
@@ -1917,9 +1532,6 @@ function searchTopLongestPathsRandom(runner, opts) {
     }
 
     settleTerminal(chain, null, reason, runner.saveState());
-    if (best.nodes === nodesBeforeRound) {
-      break;
-    }
   }
 
   runner.restoreState(rootState);
@@ -1998,8 +1610,8 @@ function renderProgressBar(nodes, maxNodes, currentDepth, terminalCount) {
   return `探索进度 [${bar}] ${percent} (${value}/${total}) | 深度:${Math.max(0, currentDepth | 0)} | 终局:${Math.max(0, terminalCount | 0)}`;
 }
 
-async function main(argv = process.argv.slice(2)) {
-  const args = parseArgs(argv);
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
   if (args.help) {
     printHelp();
     return;
@@ -2097,7 +1709,6 @@ async function main(argv = process.argv.slice(2)) {
 
     runner.init();
     if (verbose) {
-      console.log('原生快照模式:', runner.nativeSnapshotMode);
       console.log('初始决策消息:', runner.currentDecision?.message?.constructor?.name ?? '终局');
       console.log('起手卡名:', formatCards(playerOpening.opening, runtime.cardText).join(', '));
       const loadedPkgs = [
@@ -2201,13 +1812,7 @@ async function main(argv = process.argv.slice(2)) {
   }
 }
 
-module.exports = {
-  main,
-};
-
-if (require.main === module) {
-  main().catch((err) => {
-    console.error(`[combo-simulator] ${err?.message ?? err}`);
-    process.exit(1);
-  });
-}
+main().catch((err) => {
+  console.error(`[combo-simulator] ${err?.message ?? err}`);
+  process.exit(1);
+});

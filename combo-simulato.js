@@ -880,6 +880,7 @@ function searchTopLongestPathsExactSingle(runner, opts) {
   const progressEvery = Math.max(1, opts.progressEvery ?? 200)
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null
   const shouldStop = typeof opts.shouldStop === 'function' ? opts.shouldStop : null
+  const balanceCardChoiceMaxDepth = Math.max(0, opts.balanceCardChoiceMaxDepth ?? 8)
   const rootState = runner.saveState()
   const pathStateCounts = new Map()
   const chain = []
@@ -906,8 +907,8 @@ function searchTopLongestPathsExactSingle(runner, opts) {
     lastReportedNodes = best.nodes
     onProgress({ nodes: best.nodes, maxNodes: opts.maxNodes, terminalCount: best.terminalCount, currentDepth, done: false })
   }
-  const explore = (state, depth, sameKeyStreak = 0) => {
-    if (best.nodes >= opts.maxNodes) return
+  const explore = (state, depth, sameKeyStreak = 0, nodeHardLimit = opts.maxNodes) => {
+    if (best.nodes >= opts.maxNodes || best.nodes >= nodeHardLimit) return
     if (shouldStop?.()) return
     runner.restoreState(state)
     const snapshot = runner.captureSnapshot()
@@ -925,9 +926,9 @@ function searchTopLongestPathsExactSingle(runner, opts) {
     let exploredChild = false
     const nonEndActions = current.actions.filter((a) => a.kind !== 'phase_end')
     const iterActions = sortActionsForLongestPath(nonEndActions.length > 0 ? nonEndActions : current.actions)
-    for (const action of iterActions) {
-      if (best.nodes >= opts.maxNodes) break
-      if (shouldStop?.()) break
+    const runAction = (action, childLimit = nodeHardLimit) => {
+      if (best.nodes >= opts.maxNodes || best.nodes >= childLimit) return
+      if (shouldStop?.()) return
       runner.step(action)
       best.nodes += 1
       chain.push(action.label)
@@ -941,7 +942,7 @@ function searchTopLongestPathsExactSingle(runner, opts) {
         runner.restoreState(state)
         chain.pop()
         maybeReportProgress(childDepth)
-        continue
+        return
       }
       const childStateKey = makeExactStateKey(childSnapshot, childDecision)
       const childSameKeyStreak = childStateKey === stateKey ? sameKeyStreak + 1 : 0
@@ -952,11 +953,32 @@ function searchTopLongestPathsExactSingle(runner, opts) {
         childPathCount >= 3
       if (!skipBecauseLoop) {
         exploredChild = true
-        explore(childState, childDepth, childSameKeyStreak)
+        explore(childState, childDepth, childSameKeyStreak, childLimit)
       }
       runner.restoreState(state)
       chain.pop()
       maybeReportProgress(childDepth)
+    }
+
+    // 先广后深：在早期“选择卡片”分支先均分节点预算，避免第一条分支吃满 maxNodes。
+    const shouldBalanceCardChoices =
+      depth <= balanceCardChoiceMaxDepth &&
+      iterActions.length > 1 &&
+      iterActions.every((a) => typeof a?.label === 'string' && a.label.startsWith('选择卡片['))
+
+    if (shouldBalanceCardChoices) {
+      const budgetRemaining = Math.max(1, Math.min(nodeHardLimit, opts.maxNodes) - best.nodes)
+      const perChoiceBudget = Math.max(1, Math.floor(budgetRemaining / iterActions.length))
+      for (const action of iterActions) {
+        if (best.nodes >= opts.maxNodes || best.nodes >= nodeHardLimit) break
+        const childLimit = Math.min(nodeHardLimit, best.nodes + perChoiceBudget)
+        runAction(action, childLimit)
+      }
+    } else {
+      for (const action of iterActions) {
+        if (best.nodes >= opts.maxNodes || best.nodes >= nodeHardLimit) break
+        runAction(action, nodeHardLimit)
+      }
     }
     const nextCount = (pathStateCounts.get(stateKey) ?? 1) - 1
     if (nextCount > 0) pathStateCounts.set(stateKey, nextCount)
